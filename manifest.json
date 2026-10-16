@@ -1,0 +1,9 @@
+{
+  "id": "personal-meeting-notes",
+  "name": "Meetings",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Create formal and informal meeting notes and pick participants from your iCloud Contacts notes, with stub links for people not synced yet.",
+  "author": "Simon Jäggi",
+  "isDesktopOnly": false
+}
