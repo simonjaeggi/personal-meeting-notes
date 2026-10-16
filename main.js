@@ -4,10 +4,12 @@ const {
   Plugin,
   Modal,
   SuggestModal,
+  AbstractInputSuggest,
   Notice,
   PluginSettingTab,
   Setting,
   TFile,
+  TFolder,
   normalizePath,
   prepareFuzzySearch,
   moment,
@@ -15,6 +17,8 @@ const {
 
 const DEFAULT_SETTINGS = {
   contactsFolder: "Contacts",
+  contactsRecursive: false,
+  contactsExclude: "Deleted\nArchive",
   meetingsFolder: "Meetings",
   formalTemplate: "",
   informalTemplate: "",
@@ -104,13 +108,52 @@ module.exports = class PersonalMeetingNotes extends Plugin {
     await this.saveData(this.settings);
   }
 
-  // Contact notes = Markdown files directly inside the contacts folder.
-  // iCloud Contacts only manages files at that level, so Deleted/ and other subfolders are skipped.
+  // "" means the vault root.
+  contactsRoot() {
+    const p = normalizePath((this.settings.contactsFolder || "").trim() || "/");
+    return p === "/" ? "" : p;
+  }
+
+  contactsFolderExists() {
+    const root = this.contactsRoot();
+    return !root || this.app.vault.getAbstractFileByPath(root) instanceof TFolder;
+  }
+
+  // One entry per line (commas also work). An entry with a "/" is a full folder path from the
+  // vault root; a plain name (e.g. "Archive") excludes any subfolder with that name.
+  getExcludes() {
+    return (this.settings.contactsExclude || "")
+      .split(/[\n,]/)
+      .map((e) => e.trim().replace(/^\/+|\/+$/g, ""))
+      .filter(Boolean);
+  }
+
+  isContactFile(file, root = this.contactsRoot(), excludes = this.getExcludes()) {
+    if (file.extension !== "md" || !file.parent) return false;
+    const parent = file.parent.path === "/" ? "" : file.parent.path;
+    if (root && parent !== root && !parent.startsWith(root + "/")) return false;
+    if (!this.settings.contactsRecursive && parent !== root) return false;
+    if (parent === root && file.basename === "Errors") return false; // iCloud Contacts error log
+
+    const inner = root ? parent.slice(root.length).replace(/^\//, "") : parent;
+    const segments = inner ? inner.toLowerCase().split("/") : [];
+    for (const ex of excludes) {
+      if (ex.includes("/")) {
+        const p = normalizePath(ex);
+        if (parent === p || parent.startsWith(p + "/")) return false;
+      } else if (segments.includes(ex.toLowerCase())) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   getContacts() {
-    const folder = normalizePath(this.settings.contactsFolder);
+    const root = this.contactsRoot();
+    const excludes = this.getExcludes();
     return this.app.vault
       .getMarkdownFiles()
-      .filter((f) => f.parent && f.parent.path === folder && f.basename !== "Errors")
+      .filter((f) => this.isContactFile(f, root, excludes))
       .map((f) => {
         const fm = this.app.metadataCache.getFileCache(f)?.frontmatter || {};
         const aliases = [...toArray(fm.aliases), ...toArray(fm.name)].filter(
@@ -132,6 +175,12 @@ module.exports = class PersonalMeetingNotes extends Plugin {
 
   // Resolves to an array of link texts, or null if cancelled.
   pickPeople(initial = []) {
+    if (!this.contactsFolderExists()) {
+      new Notice(
+        `Contacts folder "${this.settings.contactsFolder}" not found. Set it in Settings → Meetings. You can still add people as stubs.`,
+        8000
+      );
+    }
     return new Promise((resolve) => {
       const selected = [...initial];
       const open = () =>
@@ -437,6 +486,34 @@ class MissingPeopleModal extends SuggestModal {
 
 // ---------- settings ----------
 
+class FolderInputSuggest extends AbstractInputSuggest {
+  constructor(app, inputEl, onPick) {
+    super(app, inputEl);
+    this.el = inputEl;
+    this.onPick = onPick;
+  }
+
+  getSuggestions(query) {
+    const q = query.toLowerCase();
+    return this.app.vault
+      .getAllLoadedFiles()
+      .filter((f) => f instanceof TFolder && f.path.toLowerCase().includes(q))
+      .sort((a, b) => a.path.localeCompare(b.path))
+      .slice(0, 50);
+  }
+
+  renderSuggestion(folder, el) {
+    el.setText(folder.isRoot() ? "/ (whole vault)" : folder.path);
+  }
+
+  selectSuggestion(folder) {
+    this.el.value = folder.isRoot() ? "" : folder.path;
+    this.el.dispatchEvent(new Event("input"));
+    this.close();
+    this.onPick?.();
+  }
+}
+
 class MeetingSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -445,34 +522,97 @@ class MeetingSettingTab extends PluginSettingTab {
 
   display() {
     const { containerEl } = this;
+    const plugin = this.plugin;
     containerEl.empty();
 
-    const text = (name, desc, key, placeholder) =>
+    const save = async (key, value) => {
+      plugin.settings[key] = value;
+      await plugin.saveSettings();
+      updateStatus();
+    };
+
+    // ----- Contacts -----
+    new Setting(containerEl).setName("Contacts").setHeading();
+
+    new Setting(containerEl)
+      .setName("Contacts folder")
+      .setDesc("Full path from the vault root, e.g. \"People/Contacts\". Leave empty for the whole vault.")
+      .addText((t) => {
+        t.setPlaceholder("Contacts")
+          .setValue(plugin.settings.contactsFolder)
+          .onChange((v) => save("contactsFolder", v.trim()));
+        new FolderInputSuggest(this.app, t.inputEl);
+      });
+
+    new Setting(containerEl)
+      .setName("Include subfolders")
+      .setDesc(
+        "Also offer notes in subfolders. iCloud Contacts only syncs notes directly in its folder, so leave this off if you only use synced contacts."
+      )
+      .addToggle((t) =>
+        t.setValue(plugin.settings.contactsRecursive).onChange((v) => save("contactsRecursive", v))
+      );
+
+    new Setting(containerEl)
+      .setName("Excluded folders")
+      .setDesc(
+        "One per line. A plain name (e.g. Archive) skips any subfolder with that name; a path with a slash (e.g. People/Old) skips that exact folder."
+      )
+      .addTextArea((t) => {
+        t.setPlaceholder("Deleted\nArchive")
+          .setValue(plugin.settings.contactsExclude)
+          .onChange((v) => save("contactsExclude", v));
+        t.inputEl.rows = 4;
+      });
+
+    const status = containerEl.createDiv({ cls: "setting-item-description pmn-status" });
+    const updateStatus = () => {
+      status.empty();
+      if (!plugin.contactsFolderExists()) {
+        status.addClass("pmn-warning");
+        status.setText(`⚠ Folder "${plugin.settings.contactsFolder}" not found in this vault.`);
+        return;
+      }
+      status.removeClass("pmn-warning");
+      const contacts = plugin.getContacts();
+      const sample = contacts.slice(0, 5).map((c) => c.name).join(", ");
+      status.setText(
+        `${contacts.length} contact${contacts.length === 1 ? "" : "s"} found` +
+          (sample ? `: ${sample}${contacts.length > 5 ? ", …" : ""}` : ".")
+      );
+    };
+    updateStatus();
+
+    // ----- Meetings -----
+    new Setting(containerEl).setName("Meetings").setHeading();
+
+    new Setting(containerEl)
+      .setName("Meetings folder")
+      .setDesc("Where new meeting notes are created.")
+      .addText((t) => {
+        t.setPlaceholder("Meetings")
+          .setValue(plugin.settings.meetingsFolder)
+          .onChange((v) => save("meetingsFolder", v.trim()));
+        new FolderInputSuggest(this.app, t.inputEl);
+      });
+
+    const template = (name, key, placeholder) =>
       new Setting(containerEl)
         .setName(name)
-        .setDesc(desc)
+        .setDesc("Optional note to use as the body. Leave empty for the built-in one.")
         .addText((t) =>
           t
             .setPlaceholder(placeholder)
-            .setValue(this.plugin.settings[key])
-            .onChange(async (v) => {
-              this.plugin.settings[key] = v.trim();
-              await this.plugin.saveSettings();
-            })
+            .setValue(plugin.settings[key])
+            .onChange((v) => save(key, v.trim()))
         );
-
-    text("Contacts folder", "Folder your iCloud Contacts notes sync into. Only notes directly inside it are offered.", "contactsFolder", "Contacts");
-    text("Meetings folder", "Where new meeting notes are created.", "meetingsFolder", "Meetings");
-    text("Formal template", "Optional note to use as the body. Leave empty for the built-in one.", "formalTemplate", "Templates/Formal meeting");
-    text("Informal template", "Optional note to use as the body. Leave empty for the built-in one.", "informalTemplate", "Templates/Informal meeting");
+    template("Formal template", "formalTemplate", "Templates/Formal meeting");
+    template("Informal template", "informalTemplate", "Templates/Informal meeting");
 
     new Setting(containerEl)
       .setName("Open in new tab")
       .addToggle((t) =>
-        t.setValue(this.plugin.settings.openInNewTab).onChange(async (v) => {
-          this.plugin.settings.openInNewTab = v;
-          await this.plugin.saveSettings();
-        })
+        t.setValue(plugin.settings.openInNewTab).onChange((v) => save("openInNewTab", v))
       );
   }
 }

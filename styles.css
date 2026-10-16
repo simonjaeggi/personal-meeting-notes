@@ -17,3 +17,11 @@
   width: 100%;
   margin-bottom: var(--size-4-2);
 }
+
+.pmn-status {
+  padding: var(--size-4-2) 0 var(--size-4-4);
+}
+
+.pmn-warning {
+  color: var(--text-error);
+}
