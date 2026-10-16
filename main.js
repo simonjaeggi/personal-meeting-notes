@@ -534,6 +534,18 @@ class MeetingSettingTab extends PluginSettingTab {
     // ----- Contacts -----
     new Setting(containerEl).setName("Contacts").setHeading();
 
+    const help = containerEl.createDiv({ cls: "setting-item-description pmn-help" });
+    help.createEl("p", { text: "A note shows up in the \"Who was part?\" search when:" });
+    const ul = help.createEl("ul");
+    [
+      "it's a Markdown (.md) note in the contacts folder (or a subfolder, if Include subfolders is on),",
+      "it isn't in an excluded folder, and",
+      "it isn't the iCloud Contacts error log (Errors.md).",
+    ].forEach((t) => ul.createEl("li", { text: t }));
+    help.createEl("p", {
+      text: "No special properties are needed. The search matches the file name, plus any aliases and a text name property in the frontmatter. Meeting notes link to the file name.",
+    });
+
     new Setting(containerEl)
       .setName("Contacts folder")
       .setDesc("Full path from the vault root, e.g. \"People/Contacts\". Leave empty for the whole vault.")
